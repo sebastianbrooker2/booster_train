@@ -38,12 +38,25 @@ def _head_height(env) -> torch.Tensor:
     return asset.data.body_pos_w[:, idx, 2]
 
 
-def _is_standing(env, target_height: float) -> torch.Tensor:
-    """Upright + head near target height + feet down + low speed -> standing."""
+def _base_height(env) -> torch.Tensor:
+    """World-Z of the base/pelvis. K1's verified standing base height is 0.57 m
+    (from the asset init_state) — so this is the one climb metric grounded in the
+    real robot geometry, not a guessed head height."""
+    return _robot(env).data.root_pos_w[:, 2]
+
+
+def _upright_factor(env) -> torch.Tensor:
+    """0 when horizontal (lying / downward-dog), 1 when fully upright."""
+    return torch.clamp(-_robot(env).data.projected_gravity_b[:, 2], min=0.0, max=1.0)
+
+
+def _is_standing(env, stand_height: float) -> torch.Tensor:
+    """Upright AND base near standing height AND slow -> standing. Uses BASE height
+    (verified 0.57 m), gated by uprightness, so a butt-in-air downward-dog (pelvis
+    high but body horizontal) does NOT count as standing."""
     asset = _robot(env)
-    head_h = _head_height(env)
-    upright = asset.data.projected_gravity_b[:, 2] < -0.9   # body z ~ world up
-    high = head_h > target_height * 0.9
+    upright = asset.data.projected_gravity_b[:, 2] < -0.9      # torso z ~ world up
+    high = asset.data.root_pos_w[:, 2] > stand_height * 0.88   # ~0.50 m of 0.57
     slow = torch.norm(asset.data.root_lin_vel_w, dim=-1) < 0.6
     return upright & high & slow
 
@@ -51,26 +64,32 @@ def _is_standing(env, target_height: float) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 # Task: stand up (the goal)
 # --------------------------------------------------------------------------- #
-def standing_bonus(env: ManagerBasedRLEnv, target_height: float = 0.72) -> torch.Tensor:
+def standing_bonus(env: ManagerBasedRLEnv, stand_height: float = 0.57) -> torch.Tensor:
     """Big sparse reward for being in the standing state."""
-    return _is_standing(env, target_height).float()
+    return _is_standing(env, stand_height).float()
 
 
-def head_height(env: ManagerBasedRLEnv, min_height: float = 0.5) -> torch.Tensor:
-    """Head height ABOVE a threshold (default 0.5 m). Below it -> 0, so there's no
-    reward for flicking the head up while still down; it only rewards finishing the
-    stand once the body is genuinely up."""
-    return torch.clamp(_head_height(env) - min_height, min=0.0)
-
-
-def hip_height(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Dense: mean hip/pelvis height — the PRIMARY climb signal. From prone or
-    supine the hips must come off the ground first; rewarding this (not head
-    height) avoids the 'fling the head up' exploit."""
+def head_height(env: ManagerBasedRLEnv, max_diff: float = 0.7) -> torch.Tensor:
+    """Dense head-ABOVE-feet height (HoST-style), capped at `max_diff`. This is LOW
+    in a downward-dog (head near the ground between the feet) and HIGH only when the
+    body is genuinely upright — so it pulls the head up without rewarding the park,
+    and needs no guessed absolute head height."""
     asset = _robot(env)
-    lh = asset.find_bodies(HIP_BODIES[0])[0][0]
-    rh = asset.find_bodies(HIP_BODIES[1])[0][0]
-    return 0.5 * (asset.data.body_pos_w[:, lh, 2] + asset.data.body_pos_w[:, rh, 2])
+    head_z = _head_height(env)
+    lf = asset.find_bodies(FEET_BODIES[0])[0][0]
+    rf = asset.find_bodies(FEET_BODIES[1])[0][0]
+    feet_z = 0.5 * (asset.data.body_pos_w[:, lf, 2] + asset.data.body_pos_w[:, rf, 2])
+    return torch.clamp(head_z - feet_z, min=0.0, max=max_diff)
+
+
+def upright_climb(env: ManagerBasedRLEnv, stand_height: float = 0.57) -> torch.Tensor:
+    """PRIMARY dense climb signal: base height (toward standing 0.57 m) GATED by
+    uprightness. = clamp(base_z, 0, 0.57) * upright_factor. Crucially this is ~0 in a
+    butt-in-air downward-dog (pelvis high but body horizontal -> upright_factor ~ 0),
+    which is what killed the previous run. Reward only grows when the robot rises AND
+    becomes upright — exactly the get-up we want."""
+    base_h = torch.clamp(_base_height(env), min=0.0, max=stand_height)
+    return base_h * _upright_factor(env)
 
 
 def upright(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -81,19 +100,21 @@ def upright(env: ManagerBasedRLEnv) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 # FAST: time pressure + continuous (one-motion) progress
 # --------------------------------------------------------------------------- #
-def not_standing_time_penalty(env: ManagerBasedRLEnv, target_height: float = 0.72) -> torch.Tensor:
+def not_standing_time_penalty(env: ManagerBasedRLEnv, stand_height: float = 0.57) -> torch.Tensor:
     """1.0 every step it is NOT yet standing -> with a negative, ramped weight this
     forces it to minimise time-to-stand (explosive, athletic rise)."""
-    return (~_is_standing(env, target_height)).float()
+    return (~_is_standing(env, stand_height)).float()
 
 
-def rising_velocity(env: ManagerBasedRLEnv) -> torch.Tensor:
+def rising_velocity(env: ManagerBasedRLEnv, max_vel: float = 1.0) -> torch.Tensor:
     """Reward upward head velocity -> continuous progress = one fluid motion,
-    not stop-start (no reward for parking in a stable intermediate)."""
+    not stop-start (no reward for parking in a stable intermediate). CAPPED at
+    `max_vel`: without the cap an ever-faster fling farms this reward (a cheat);
+    capping rewards steady progress, not violent launches."""
     asset = _robot(env)
     idx = asset.find_bodies(HEAD_BODY)[0][0]
     head_vel_z = asset.data.body_lin_vel_w[:, idx, 2]
-    return torch.clamp(head_vel_z, min=0.0)
+    return torch.clamp(head_vel_z, min=0.0, max=max_vel)
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +136,18 @@ def hip_flexion_reward(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg) -> tor
     asset = _robot(env)
     hip_pitch = asset.data.joint_pos[:, asset_cfg.joint_ids]
     return torch.sum(torch.clamp(-hip_pitch, min=0.0), dim=1)
+
+
+def arms_at_side(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, stand_height: float = 0.57) -> torch.Tensor:
+    """When standing, reward arm joints near neutral so the get-up ENDS with the arms down
+    at the sides (not flailing / overhead). Only active once standing, so arms are still
+    free to push off during the rise. Target = 0 for shoulder+elbow joints; verify 'down at
+    sides' in the viewer and adjust the target if 0 isn't arms-down for this URDF."""
+    asset = _robot(env)
+    standing = _is_standing(env, stand_height).float()
+    jp = asset.data.joint_pos[:, asset_cfg.joint_ids]
+    err = torch.sum(torch.square(jp), dim=1)
+    return torch.exp(-err) * standing
 
 
 def supine_hips_over_head(env: ManagerBasedRLEnv) -> torch.Tensor:
@@ -143,49 +176,62 @@ def supine_backward_roll(env: ManagerBasedRLEnv) -> torch.Tensor:
 # --------------------------------------------------------------------------- #
 # Stability once up
 # --------------------------------------------------------------------------- #
-def standing_stability(env: ManagerBasedRLEnv, target_height: float = 0.72) -> torch.Tensor:
+def standing_stability(env: ManagerBasedRLEnv, stand_height: float = 0.57) -> torch.Tensor:
     """When standing, reward low base velocity (hold the pose, don't topple)."""
     asset = _robot(env)
-    standing = _is_standing(env, target_height).float()
+    standing = _is_standing(env, stand_height).float()
     vel = torch.sum(torch.square(asset.data.root_lin_vel_w[:, :2]), dim=-1) + \
         torch.sum(torch.square(asset.data.root_ang_vel_w), dim=-1)
     return torch.exp(-1.0 * vel) * standing
 
 
 def feet_under_body(env: ManagerBasedRLEnv) -> torch.Tensor:
-    """Reward feet being below the trunk (encourages getting feet underneath)."""
+    """Reward feet below the trunk (feet getting underneath), GATED by uprightness so a
+    downward-dog (trunk also above the feet, but body horizontal) doesn't earn it."""
     asset = _robot(env)
     trunk_idx = asset.find_bodies(TRUNK_BODY)[0][0]
     trunk_h = asset.data.body_pos_w[:, trunk_idx, 2]
     lf = asset.find_bodies(FEET_BODIES[0])[0][0]
     rf = asset.find_bodies(FEET_BODIES[1])[0][0]
     feet_h = 0.5 * (asset.data.body_pos_w[:, lf, 2] + asset.data.body_pos_w[:, rf, 2])
-    return torch.clamp(trunk_h - feet_h, min=0.0)
+    return torch.clamp(trunk_h - feet_h, min=0.0) * _upright_factor(env)
 
 
 # --------------------------------------------------------------------------- #
 # Assist force (applied here as a side-effect every step; level set by curriculum)
 # --------------------------------------------------------------------------- #
-def apply_assist_force(env: ManagerBasedRLEnv, body_names: list[str] = HIP_BODIES) -> torch.Tensor:
-    """Apply a WORLD-up assist force on the HIPS (split across both hip bodies), so the
-    pelvis is lifted first — magnitude = env._assist_force (set by the curriculum).
-    Returns 0 (no direct reward)."""
+def _ensure_assist_state(env, initial: float) -> None:
+    """Lazily create the PER-ENV assist state (force magnitude + per-episode peak base
+    height). Per-env (shape [N]) is the whole point: each robot weans off its own assist
+    when IT succeeds, so the population transitions gradually from assisted to unassisted."""
+    if not hasattr(env, "_assist_force") or env._assist_force.shape[0] != env.num_envs:
+        env._assist_force = torch.full((env.num_envs,), float(initial), device=env.device)
+        env._epi_max_base = torch.zeros(env.num_envs, device=env.device)
+
+
+def apply_assist_force(
+    env: ManagerBasedRLEnv, body_names: list[str] = (TRUNK_BODY,), initial: float = 120.0
+) -> torch.Tensor:
+    """PER-ENV world-up assist on the TRUNK (not the hips — pulling the hips up from a
+    face-down pose just lifts the butt into a downward-dog; pulling the TORSO up rotates
+    the body toward upright, HoST-style). Magnitude = env._assist_force[env] (a tensor,
+    weaned to 0 per-env by assist_force_curriculum), so the FINAL policy stands with NO
+    assist -> not a cheat. Also tracks each episode's peak base height for the curriculum.
+    Returns 0 (no reward)."""
     from isaaclab.utils.math import quat_apply_inverse
 
     asset = _robot(env)
+    _ensure_assist_state(env, initial)
+
+    # track the episode's peak base height -> the curriculum decays force per-env on success
+    env._epi_max_base = torch.maximum(env._epi_max_base, _base_height(env))
+
     body_ids = [asset.find_bodies(n)[0][0] for n in body_names]
     nb = len(body_ids)
     torques = torch.zeros(env.num_envs, nb, 3, device=env.device)
-    force_mag = float(getattr(env, "_assist_force", 0.0))
-    if force_mag < 1.0:
-        asset.set_external_force_and_torque(
-            torch.zeros(env.num_envs, nb, 3, device=env.device), torques, body_ids=body_ids
-        )
-        return torch.zeros(env.num_envs, device=env.device)
-
-    quats = asset.data.body_quat_w[:, body_ids]                       # (N, nb, 4)
     world_up = torch.zeros(env.num_envs, nb, 3, device=env.device)
-    world_up[:, :, 2] = force_mag / nb                               # split evenly across the hips
+    world_up[:, :, 2] = (env._assist_force / nb).unsqueeze(-1)        # (N, nb): per-env, split across bodies
+    quats = asset.data.body_quat_w[:, body_ids]                       # (N, nb, 4)
     local_force = quat_apply_inverse(quats, world_up)                # (N, nb, 3) world-up in each body frame
     asset.set_external_force_and_torque(local_force, torques, body_ids=body_ids)
     return torch.zeros(env.num_envs, device=env.device)

@@ -10,22 +10,34 @@
 
 from __future__ import annotations
 
+import torch
+
 import booster_train.tasks.manager_based.locomotion.k1_getup.rewards as R
 
 
 def assist_force_curriculum(
     env, env_ids,
     initial: float = 120.0,
-    target_height: float = 0.72,
-    force_step: float = 0.06,
+    threshold_height: float = 0.50,
+    force_step: float = 4.0,
 ) -> float:
-    """Hold a strong upward assist early; decay it while it's reaching standing height."""
-    if not hasattr(env, "_assist_force"):
-        env._assist_force = float(initial)
-    mean_head = R._head_height(env).mean().item()
-    if mean_head > target_height and env._assist_force > 0.0:
-        env._assist_force = max(0.0, env._assist_force - force_step)
-    return env._assist_force
+    """PER-ENV wean of the upward assist (HoST-style vertical-pull curriculum).
+
+    Runs at reset (curriculum_manager.compute fires BEFORE scene.reset), so
+    env._epi_max_base still holds the just-finished episode's PEAK BASE height for
+    each resetting env. For every resetting env whose base got above `threshold_height`
+    (0.50 m, i.e. ~88% of K1's verified 0.57 m standing height), drop THAT env's assist
+    by `force_step` (monotonic -> 0). Envs that never got up keep their assist, so the
+    population transitions gradually from assisted to fully unassisted — and the final
+    policy stands with no assist.
+    """
+    R._ensure_assist_state(env, initial)
+    reached = (env._epi_max_base[env_ids] > threshold_height).float()
+    env._assist_force[env_ids] = torch.clamp(
+        env._assist_force[env_ids] - force_step * reached, min=0.0
+    )
+    env._epi_max_base[env_ids] = 0.0   # reset peak tracking for the new episode
+    return env._assist_force.mean().item()
 
 
 def speed_pressure_curriculum(
